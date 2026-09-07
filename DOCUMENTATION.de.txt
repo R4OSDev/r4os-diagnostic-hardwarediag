@@ -1,25 +1,24 @@
 ﻿HWDIAG.R4X
 ==========
 
-HWDIAG.R4X ist die Hardware-Inventory-Diagnose.
+HWDIAG.R4X ist die schreibfreie Hardware-Inventory-Diagnose. Ohne Parameter
+zeigt sie die Hardwareuebersicht, Storage-/USB-/Runtime-Eintraege und eine
+Inventarstichprobe. /MIN kuerzt auf die Uebersicht, /FULL fordert das gesamte
+Inventar an. Der Berichtspuffer ist auf 16 KB begrenzt; ein abgeschnittener
+/FULL-Bericht meldet FAILED und ist kein vollstaendiger Hardwarebeleg.
 
-Projektstruktur seit 0.51.21:
-- `build.zig` baut die Diagnose als eigenes SDK-Projekt.
-- `build.zig.zon` bindet `r4os_sdk` als Paket.
-- `module.R4MF` beschreibt Artefakt, Zielpfad, R4L-Imports und Contract.
+/EXPORT schreibt ausdruecklich den Standardbericht nach C:\HWDIAG.TXT und
+prueft ihn durch Ruecklesen. In Recovery liegt C: im fluechtigen RAM.
+Die angezeigten Bindungszustaende kommen aus dem Kernelinventar; HWDIAG
+probt oder initialisiert keine Hardware selbst.
 
-Build:
+Build im Repository unter Windows mit Build.bat, unter Linux mit ./Build.sh.
+Settings.R4S bindet SDK, Contract, DevKit und Artefaktordner an die lokalen
+Checkouts. Standardartefakt im Workspace:
 
-    cd Code\System\Diagnostics\HardwareDiag
-    ..\..\..\DevTools\Zig\zig.exe build
+    Artifacts/Modules/HardwareDiag/HWDIAG.R4X
 
-Ergebnis:
-
-    Code\System\Diagnostics\HardwareDiag\zig-out\HWDIAG.R4X
-
-Contract:
-- Build-Profil: `Zig/R4XStart`
-- R4XStart-Entry: `hwdiag_main`
-- App-Klasse: `console`
-- R4L-Imports: `R4SYS`, `R4DEV`
-- Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\DIAG\HWDIAG.R4X`
+module.R4MF besitzt Version, Ziel, Imports und App-Klasse. Die Diagnose
+verwendet ENTRY_MODE=app mit r4_app_main und die eingebauten Platform APIs
+R4SYS und R4DEV; diese Imports sind keine separaten R4L-Dateien.
+Imageziel: C:\R4OS\SOFTWARE\TERMINAL\DIAG\HWDIAG.R4X, IMAGE_SCOPE=test.
