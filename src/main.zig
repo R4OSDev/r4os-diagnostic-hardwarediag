@@ -97,7 +97,7 @@ const App = struct {
         }
 
         writer.line("");
-        writer.line("Cross references: DMESG for boot/error log, BOOTINFO.R4X for loader map, MEMVIEW.R4X for memory, DEVMGR.R4X for device details.");
+        writer.line("Cross references: SPECTRA LOGS BOOT for kernel logs, SPECTRA METRICS BOOT for loader maps, SPECTRA METRICS MEMORY for memory, DEVMGR.R4X for device details.");
         return true;
     }
 };
