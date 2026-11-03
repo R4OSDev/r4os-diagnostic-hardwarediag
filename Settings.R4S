@@ -1,6 +1,8 @@
-# HardwareDiag repository path mappings. Relative to this repository root.
+﻿# HardwareDiag repository path mappings. Relative to this repository root.
 SDK_ROOT=../../SDK
 CONTRACT_ROOT=../../Contract
 DEVKIT_ROOT=../../../DevKit
 ARTIFACTS_ROOT=../../../Artifacts/Modules/HardwareDiag
 ZIG_ROOT=Toolchains/Zig
+
+LIBRARIES_ROOT=../../Libraries
