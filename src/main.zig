@@ -1,7 +1,7 @@
 const r4os = @import("r4os");
 
 const export_path = "C:\\HWDIAG.TXT";
-const report_capacity: usize = 16 * 1024;
+const report_capacity: usize = 64 * 1024;
 
 const Profile = enum {
     min,
@@ -12,19 +12,39 @@ const Profile = enum {
 
 const App = struct {
     sys: r4os.r4sys.Context,
-    inventory: r4os.DeviceInventoryView,
+    app: *r4os.App2,
+    dev: r4os.r4dev.Context,
+    files: r4os.Files,
+    records: []const r4os.abi.DeviceInventoryRecord = &.{},
+    inventory: r4os.abi.DeviceInventorySnapshotInfo = .{},
 
-    fn init(app: *r4os.App) ?App {
-        return .{ .sys = app.system(), .inventory = (app.devices() orelse return null).inventory() };
+    fn init(app: *r4os.App2) ?App {
+        return .{ .app = app, .sys = app.system(), .dev = app.devicesLowLevel() orelse return null, .files = app.files() orelse return null };
     }
 
     fn run(self: *App) i32 {
-        const args = zSlice(self.sys.argsRaw());
-        const profile = parseProfile(args);
+        const profile = parseProfile(self.app) orelse return 2;
+        const provider = self.app.deviceSnapshotProvider() catch return 1;
+        var sizing = r4os.device_snapshot.Snapshot.init(.{}, 0, provider) catch return 1;
+        defer _ = sizing.close() catch {};
+        const needed = sizing.capture(false) catch return 1;
+        if (needed.status != @intFromEnum(r4os.device_snapshot.Status.capacity) and
+            needed.status != @intFromEnum(r4os.device_snapshot.Status.complete)) return 1;
+        const allocator = self.app.allocator() orelse return 1;
+        const records = allocator.alloc(r4os.abi.DeviceInventoryRecord, needed.info.required_count) catch return 1;
+        defer allocator.free(records);
+        const bytes = @import("std").mem.sliceAsBytes(records);
+        var snapshot = r4os.device_snapshot.Snapshot.init(.{ .address = @intFromPtr(bytes.ptr), .length = bytes.len }, @intCast(records.len), provider) catch return 1;
+        defer _ = snapshot.close() catch {};
+        const captured = snapshot.capture(false) catch return 1;
+        // Capacity growth or incomplete capture never becomes a partial report.
+        if (captured.status != @intFromEnum(r4os.device_snapshot.Status.complete)) return 1;
+        self.records = snapshot.records() catch return 1;
+        self.inventory = captured.info;
         if (profile == .export_report) return self.exportReport();
-
-        var buffer: [report_capacity]u8 = undefined;
-        var writer = Writer.init(buffer[0..]);
+        const buffer = allocator.alloc(u8, report_capacity) catch return 1;
+        defer allocator.free(buffer);
+        var writer = Writer.init(buffer);
         const ok = self.buildReport(&writer, profile);
         self.sys.write(writer.bytes());
         self.sys.write("HWDIAG result: ");
@@ -33,17 +53,26 @@ const App = struct {
     }
 
     fn exportReport(self: *App) i32 {
-        var buffer: [report_capacity]u8 = undefined;
-        var writer = Writer.init(buffer[0..]);
+        const allocator = self.app.allocator() orelse return 1;
+        const buffer = allocator.alloc(u8, report_capacity) catch return 1;
+        defer allocator.free(buffer);
+        var writer = Writer.init(buffer);
         const ok_report = self.buildReport(&writer, .std);
         const data = writer.bytes();
-        _ = self.sys.fileDelete(export_path);
-        const written = self.sys.fileWrite(export_path, data);
-
-        var verify: [report_capacity]u8 = undefined;
-        const read = self.sys.fileRead(export_path, verify[0..]);
-        const ok = ok_report and !writer.truncated and written == @as(i32, @intCast(data.len)) and
-            read == @as(i32, @intCast(data.len)) and startsWith(verify[0..@intCast(read)], "HWDIAG.R4X");
+        const path = r4os.AbsoluteFilePath.parse(export_path) catch return 1;
+        // Keep the established report file and format. Verify its complete
+        // metadata2 snapshot and every byte, rather than just the magic prefix.
+        const written: usize = switch (self.files.write(path.asZ(), data)) {
+            .bytes => |count| count,
+            else => 0,
+        };
+        const verify = allocator.alloc(u8, report_capacity) catch return 1;
+        defer allocator.free(verify);
+        const read = self.files.readDocumentPrefix(path.asZ(), verify, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = 1_000_000_000 });
+        const ok = ok_report and !writer.truncated and written == data.len and switch (read) {
+            .value => |value| value.file_size == data.len and value.bytes == data.len and @import("std").mem.eql(u8, data, verify[0..value.bytes]),
+            .failure => false,
+        };
 
         self.sys.write("HWDIAG export: ");
         self.sys.write(if (ok) "OK" else "FAILED");
@@ -62,16 +91,17 @@ const App = struct {
         writer.line(profileName(profile));
         writer.line("");
 
-        const hw = self.inventory.hardware() orelse {
+        const hw = self.dev.hardwareSummary() orelse {
             writer.line("Hardware-Summary: not available");
             return false;
         };
         writeHardwareSummary(writer, hw);
 
-        const inv = self.inventory.summary() orelse {
-            writer.line("");
-            writer.line("Device inventory: not available");
-            return false;
+        const inv: r4os.abi.DeviceInventorySummary = .{
+            .total = self.inventory.count,
+            .with_driver = self.inventory.with_driver,
+            .without_driver = self.inventory.without_driver,
+            .unknown = self.inventory.unknown,
         };
         writeInventorySummary(writer, inv);
 
@@ -102,7 +132,7 @@ const App = struct {
     }
 };
 
-pub fn r4_app_main(raw_app: *r4os.App) i32 {
+pub fn r4_app_main(raw_app: *r4os.App2) i32 {
     var app = App.init(raw_app) orelse return r4os.abi.err_no_group;
     return app.run();
 }
@@ -166,17 +196,10 @@ fn writeInventorySummary(writer: *Writer, inv: r4os.abi.DeviceInventorySummary) 
 }
 
 fn writeFilteredRecords(app: *App, writer: *Writer, filter: RecordFilter) void {
-    const inv = app.inventory.summary() orelse {
-        writer.line("  not available");
-        return;
-    };
-
     var count: u32 = 0;
-    var index: u32 = 0;
-    while (index < inv.total) : (index += 1) {
-        const rec = app.inventory.record(index) orelse continue;
+    for (app.records, 0..) |rec, index| {
         if (!matchesFilter(rec, filter)) continue;
-        writeRecord(writer, index, rec);
+        writeRecord(writer, @intCast(index), rec);
         count += 1;
     }
     if (count == 0) writer.line("  none");
@@ -186,8 +209,8 @@ fn writeRecords(app: *App, writer: *Writer, total: u32, limit: u32, all: bool) v
     const max = if (all or limit == 0 or total <= limit) total else limit;
     var index: u32 = 0;
     while (index < max) : (index += 1) {
-        const rec = app.inventory.record(index) orelse continue;
-        writeRecord(writer, index, rec);
+        const rec = app.records[index];
+        writeRecord(writer, @intCast(index), rec);
     }
     if (max < total) {
         writer.write("  ... ");
@@ -241,11 +264,18 @@ fn matchesFilter(rec: r4os.abi.DeviceInventoryRecord, filter: RecordFilter) bool
     };
 }
 
-fn parseProfile(args: []const u8) Profile {
-    if (containsIgnoreCase(args, "EXPORT") or containsIgnoreCase(args, "/EXPORT")) return .export_report;
-    if (containsIgnoreCase(args, "FULL") or containsIgnoreCase(args, "/FULL")) return .full;
-    if (containsIgnoreCase(args, "MIN") or containsIgnoreCase(args, "/MIN")) return .min;
-    return .std;
+fn parseProfile(app: *r4os.App2) ?Profile {
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = app.argCursor(.{ .quotes = 0 }, &failure) catch return null;
+    var profile: Profile = .std;
+    while (cursor.next() catch return null) |token| {
+        const text = token.bytes(app.args()) catch return null;
+        // Preserve the original aliases and priority when flags are combined.
+        if (containsIgnoreCase(text, "EXPORT")) profile = .export_report
+        else if (containsIgnoreCase(text, "FULL") and profile != .export_report) profile = .full
+        else if (containsIgnoreCase(text, "MIN") and profile == .std) profile = .min;
+    }
+    return profile;
 }
 
 fn profileName(profile: Profile) []const u8 {
@@ -405,21 +435,6 @@ fn spanZ(value: []const u8) []const u8 {
     var len: usize = 0;
     while (len < value.len and value[len] != 0) : (len += 1) {}
     return value[0..len];
-}
-
-fn zSlice(ptr: [*:0]const u8) []const u8 {
-    var len: usize = 0;
-    while (ptr[len] != 0) : (len += 1) {}
-    return ptr[0..len];
-}
-
-fn startsWith(value: []const u8, prefix: []const u8) bool {
-    if (value.len < prefix.len) return false;
-    var i: usize = 0;
-    while (i < prefix.len) : (i += 1) {
-        if (value[i] != prefix[i]) return false;
-    }
-    return true;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
